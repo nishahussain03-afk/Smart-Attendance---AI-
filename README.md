@@ -42,6 +42,9 @@ The system automatically:
 
 ---
 
+<img width="1365" height="628" alt="image" src="https://github.com/user-attachments/assets/cf3ce0e7-df05-4f50-bcbe-79aa32947087" />
+
+
 ## ✨ Key Features
 
 ### 🎓 Student Portal
@@ -111,6 +114,9 @@ Students with attendance below the required percentage are highlighted for atten
 > **75%**
 
 ---
+
+<img width="1073" height="695" alt="image" src="https://github.com/user-attachments/assets/905f420d-9b52-431a-b8b4-040afd98114a" />
+
 
 ### 🤖 AI-Powered Insights
 
