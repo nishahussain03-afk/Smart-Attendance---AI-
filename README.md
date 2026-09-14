@@ -67,6 +67,8 @@ SmartAttend AI addresses these problems through an automated web-based attendanc
 The application provides separate interfaces for students and administrators while also providing an AI Attendance Assistant for attendance-related queries.
 
 ---
+<img width="1365" height="621" alt="image" src="https://github.com/user-attachments/assets/5ff9bb33-f443-4182-8cf8-ac7d879c0029" />
+---
 
 # 🎯 Problem Statement
 
@@ -745,6 +747,9 @@ Stores manually added holidays.
 | `holiday_date` | Holiday date |
 | `holiday_name` | Holiday name |
 
+
+---
+<img width="1363" height="633" alt="image" src="https://github.com/user-attachments/assets/2e17edda-56e8-4a12-a780-20235d9056a5" />
 ---
 
 ## College Calendar Table
@@ -998,6 +1003,8 @@ The Student Portal allows students to:
 6. View attendance status.
 
 ---
+<img width="1365" height="636" alt="image" src="https://github.com/user-attachments/assets/0965b04c-424c-4786-8701-dab75f573dea" />
+---
 
 # 🔐 Admin Dashboard
 
@@ -1011,6 +1018,9 @@ The Admin Dashboard allows administrators to:
 * Generate reports
 * View complete attendance history
 
+
+---
+<img width="1365" height="628" alt="image" src="https://github.com/user-attachments/assets/32b6bf6b-3597-4b49-a4cb-6ac545087724" />
 ---
 
 # 🤖 AI Attendance Assistant
