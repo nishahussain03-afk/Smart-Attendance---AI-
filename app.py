@@ -2,6 +2,8 @@ import streamlit as st
 import sqlite3
 import re
 import math
+import os
+import requests
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -248,7 +250,8 @@ def parse_date_from_question(question):
 
     date_patterns = [
         r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b",
-        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b"
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b",
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+(\d{4}))?\b"
     ]
 
     for pattern in date_patterns:
@@ -264,14 +267,15 @@ def parse_date_from_question(question):
 
                 groups = match.groups()
 
-                if len(groups[0]) == 4:
-
+                if len(groups) == 3 and groups[1].isalpha():
+                    day = int(groups[0])
+                    month = datetime.strptime(groups[1], "%B").month
+                    year = int(groups[2]) if groups[2] else today.year
+                elif len(groups[0]) == 4:
                     year = int(groups[0])
                     month = int(groups[1])
                     day = int(groups[2])
-
                 else:
-
                     day = int(groups[0])
                     month = int(groups[1])
                     year = int(groups[2])
@@ -1391,1095 +1395,489 @@ def calendar_answer_for_date(
 # AI ATTENDANCE ASSISTANT
 # ============================================================
 
-def database_answer(
-    question,
-    context_student=None
-):
+def _normalise_text(text):
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9%/\-\s]", " ", text)
+    return re.sub(r"\s+", " ", text)
 
-    q = question.lower().strip()
 
-    summary = get_attendance_summary()
+def _date_label(date_value):
+    try:
+        return datetime.fromisoformat(date_value).strftime("%d-%m-%Y")
+    except Exception:
+        return date_value
 
-    # ========================================================
-    # DATE CONTEXT
-    # ========================================================
 
-    requested_date = parse_date_from_question(
-        question
-    )
+def _records_for_date_with_students(date_value):
+    return get_records_for_date(date_value, SUBJECT)
 
-    # ========================================================
-    # STUDENT DETECTION
-    # ========================================================
 
-    student = find_student_from_question(
-        question
-    )
+def _present_absent_lists(date_value):
+    records = _records_for_date_with_students(date_value)
+    present = [r for r in records if r[2] == "Present"]
+    absent = [r for r in records if r[2] == "Absent"]
+    return records, present, absent
 
-    if student is None and context_student:
 
-        if any(
-            word in q
-            for word in [
-                "she",
-                "her",
-                "he",
-                "him",
-                "his",
-                "that student",
-                "this student",
-                "that person",
-                "their",
-                "them"
-            ]
-        ):
+def _format_student_list(title, students):
+    if not students:
+        return f"{title}\n\nNo students found."
+    lines = [title, ""]
+    for i, (roll_no, name, *_) in enumerate(students, 1):
+        lines.append(f"{i}. {roll_no} — {name}")
+    return "\n".join(lines)
 
-            student = context_student
 
-    # ========================================================
-    # GREETINGS
-    # ========================================================
+def _attendance_date_from_question(question):
+    requested = parse_date_from_question(question)
+    if requested:
+        return requested
+    q = _normalise_text(question)
+    if "today" in q or "todays" in q:
+        return today_date()
+    return None
 
-    if q in [
-        "hi",
-        "hello",
-        "hey",
-        "hai",
-        "hii",
-        "good morning",
-        "good afternoon",
-        "good evening"
-    ]:
 
+def _student_context_from_question(question, context_student):
+    student = find_student_from_question(question)
+    if student:
+        return student
+    q = _normalise_text(question)
+    pronouns = {
+        "she", "her", "hers", "he", "him", "his", "they", "them",
+        "their", "that student", "this student", "that person", "the student"
+    }
+    if context_student and any(x in q for x in pronouns):
+        return context_student
+    return None
+
+
+def _get_class_stats(date_value=None):
+    if date_value:
+        records = get_records_for_date(date_value, SUBJECT)
+        present = sum(1 for r in records if r[2] == "Present")
+        absent = sum(1 for r in records if r[2] == "Absent")
+        return len(STUDENTS), present, absent, records
+
+    records = get_today_records(SUBJECT)
+    present = sum(1 for r in records if r[2] == "Present")
+    absent = sum(1 for r in records if r[2] == "Absent")
+    return len(STUDENTS), present, absent, records
+
+
+def _date_attendance_answer(date_value, requested_status=None):
+    if not is_working_day(date_value):
         return (
-            "Hello! 👋 I'm SmartAttend AI.\n\n"
-            "I can help you with student details, "
-            "attendance, attendance percentage, "
-            "75% risk analysis, today's attendance, "
-            "college holidays, calendar information, "
-            "and SmartAttend rules.\n\n"
-            "What would you like to know?"
+            f"🏖️ **{_date_label(date_value)}** was a non-working day.\n\n"
+            f"Reason: **{get_non_working_day_reason(date_value)}**\n\n"
+            "No attendance session was scheduled."
         )
 
-    # ========================================================
-    # WHAT CAN YOU DO
-    # ========================================================
+    records, present, absent = _present_absent_lists(date_value)
 
-    if (
-        "what can you do" in q
-        or "help me" in q
-        or "how can you help" in q
-        or "what do you know" in q
-    ):
-
-        return (
-            "Of course! 😊 I can help you with almost "
-            "anything related to SmartAttend.\n\n"
-            "🎓 **Students**\n"
-            "• Find a student's name or roll number\n"
-            "• Check registered students\n"
-            "• Check class details\n\n"
-            "📊 **Attendance**\n"
-            "• Individual attendance\n"
-            "• Present and absent students\n"
-            "• Attendance percentage\n"
-            "• Highest and lowest attendance\n"
-            "• Students below 75%\n"
-            "• Attendance history\n"
-            "• Attendance trends and calculations\n\n"
-            "📅 **Calendar**\n"
-            "• Today's working/holiday status\n"
-            "• Tomorrow and yesterday\n"
-            "• Specific dates\n"
-            "• College events and calendar information\n\n"
-            "⚙️ **Application Rules**\n"
-            "• Attendance timing\n"
-            "• Minimum attendance requirement\n"
-            "• Department, year and shift\n"
-            "• What happens after 1:15 PM\n\n"
-            "Just ask naturally — you don't need to use "
-            "a specific command. 🙂"
-        )
-
-    # ========================================================
-    # APPLICATION INFORMATION
-    # ========================================================
-
-    if (
-        "minimum attendance" in q
-        or "attendance requirement" in q
-        or "required attendance" in q
-        or "how much attendance" in q
-        or "attendance percentage required" in q
-    ):
-
-        return (
-            f"The minimum attendance requirement "
-            f"in SmartAttend is **{MIN_ATTENDANCE:.0f}%**. "
-            "Students below this level are considered "
-            "at risk."
-        )
-
-    if (
-        (
-            "what time" in q
-            and (
-                "attendance" in q
-                or "mark" in q
+    if requested_status == "absent":
+        if not records:
+            return (
+                f"📅 There are no finalized attendance records for **{_date_label(date_value)}** yet."
             )
-        )
-        or "attendance timing" in q
-        or "attendance time" in q
-        or "when can i mark" in q
-        or "when can students mark" in q
-    ):
-
         return (
-            "Students can mark attendance from "
-            "**1:00 PM to 1:15 PM** on a working day. "
-            "The same student cannot mark attendance "
-            "twice for the same session."
+            f"❌ **Absent Students — {_date_label(date_value)}**\n\n"
+            f"Total Students: {len(STUDENTS)}\n"
+            f"Present: {len(present)}\n"
+            f"Absent: {len(absent)}\n\n" +
+            ("\n".join(f"{i}. {r[0]} — {r[1]}" for i, r in enumerate(absent, 1))
+             if absent else "No students were absent.")
         )
 
-    if (
-        "after 1:15" in q
-        or "after 1.15" in q
-        or "miss the attendance" in q
-        or "if i don't mark" in q
-        or "if a student doesn't mark" in q
-    ):
-
+    if requested_status == "present":
+        if not records:
+            return f"📅 There are no finalized attendance records for **{_date_label(date_value)}** yet."
         return (
-            "After the 1:15 PM attendance window closes, "
-            "students can no longer mark attendance for "
-            "that session. SmartAttend automatically "
-            "records students who did not mark attendance "
-            "as **Absent** when the session is finalized."
+            f"✅ **Present Students — {_date_label(date_value)}**\n\n"
+            f"Total Students: {len(STUDENTS)}\n"
+            f"Present: {len(present)}\n"
+            f"Absent: {len(absent)}\n\n" +
+            ("\n".join(f"{i}. {r[0]} — {r[1]}" for i, r in enumerate(present, 1))
+             if present else "No students were present.")
         )
 
-    if (
-        "department" in q
-        or "which department" in q
-        or "what department" in q
-    ):
-
+    if not records:
         return (
-            f"The class is **{DEPARTMENT}**."
+            f"📅 **Attendance — {_date_label(date_value)}**\n\n"
+            "The date is a working day, but no finalized attendance records are available yet."
         )
 
-    if (
-        "which year" in q
-        or "what year" in q
-        or "year are we" in q
-        or "which class year" in q
-    ):
+    rate = len(present) / len(STUDENTS) * 100 if STUDENTS else 0
+    return (
+        f"📊 **Attendance — {_date_label(date_value)}**\n\n"
+        f"Total Students: {len(STUDENTS)}\n"
+        f"Present: {len(present)}\n"
+        f"Absent: {len(absent)}\n"
+        f"Attendance Rate: **{rate:.2f}%**\n\n"
+        "Ask **who was present** or **who was absent** if you want the complete list."
+    )
 
+
+def _history_matrix_data(start_date=None, end_date=None):
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT attendance_date
+            FROM attendance
+            WHERE subject = ?
+            ORDER BY attendance_date
+            """,
+            (SUBJECT,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    dates = [r[0] for r in rows]
+    if start_date:
+        dates = [d for d in dates if d >= start_date]
+    if end_date:
+        dates = [d for d in dates if d <= end_date]
+    return dates
+
+
+def build_attendance_matrix(start_date=None, end_date=None):
+    dates = _history_matrix_data(start_date, end_date)
+    if not dates:
+        return []
+
+    lookup = {}
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT roll_no, attendance_date, status
+            FROM attendance
+            WHERE subject = ?
+            """,
+            (SUBJECT,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for roll_no, attendance_date, status in rows:
+        if attendance_date in dates:
+            lookup[(roll_no, attendance_date)] = "P" if status == "Present" else "A"
+
+    matrix = []
+    for roll_no, name in get_all_students():
+        row = {"Roll No": roll_no, "Name": name}
+        for d in dates:
+            row[_date_label(d)] = lookup.get((roll_no, d), "-")
+        completed = [lookup.get((roll_no, d)) for d in dates if lookup.get((roll_no, d))]
+        if completed:
+            p_count = completed.count("P")
+            row["Attendance %"] = round(p_count / len(completed) * 100, 2)
+        else:
+            row["Attendance %"] = None
+        matrix.append(row)
+    return matrix
+
+
+def _llm_fallback(question, context_student=None):
+    """Optional natural-language fallback. It never invents database facts."""
+    token = os.getenv("HF_TOKEN", "")
+    if not token:
+        try:
+            token = st.secrets.get("HF_TOKEN", "")
+        except Exception:
+            token = ""
+    if not token:
+        return None
+
+    model = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    today = today_date()
+    total, present, absent, records = _get_class_stats()
+    context = {
+        "application": "SmartAttend AI",
+        "department": DEPARTMENT,
+        "year": YEAR,
+        "shift": SHIFT,
+        "minimum_attendance": MIN_ATTENDANCE,
+        "attendance_window": "1:00 PM to 1:15 PM",
+        "registered_students": len(STUDENTS),
+        "today": today,
+        "today_is_working_day": is_working_day(today),
+        "today_reason": get_non_working_day_reason(today) if not is_working_day(today) else "Working Day",
+        "today_present": present,
+        "today_absent": absent,
+        "today_records_available": bool(records),
+        "context_student": context_student,
+    }
+
+    prompt = (
+        "You are SmartAttend AI, a college attendance assistant. "
+        "Answer only from the supplied application context. Never invent student names, "
+        "attendance records, dates, percentages, or rules. If the context does not contain "
+        "the requested fact, say that it is not available and explain what can be checked. "
+        "Be concise but complete.\n\n"
+        f"APPLICATION CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"
+    )
+
+    try:
+        response = requests.post(
+            f"https://router.huggingface.co/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a factual SmartAttend application assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 700,
+            },
+            timeout=30,
+        )
+        if response.ok:
+            data = response.json()
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+    return None
+
+
+def database_answer(question, context_student=None):
+    q = _normalise_text(question)
+    requested_date = _attendance_date_from_question(question)
+    student = _student_context_from_question(question, context_student)
+
+    # Greetings and capability questions
+    if q in {"hi", "hello", "hey", "hai", "hii", "good morning", "good afternoon", "good evening"}:
         return (
-            f"The class is in **{YEAR}**."
+            "Hello! 👋 I'm **SmartAttend AI**.\n\n"
+            "Ask me naturally about students, attendance, dates, attendance history, "
+            "75% risk, present/absent lists, class statistics, holidays, calendar rules, "
+            "attendance timing, or how this application works."
         )
 
-    if (
-        "which shift" in q
-        or "what shift" in q
-    ):
-
+    if any(x in q for x in ["what can you do", "how can you help", "what do you know", "help me"]):
         return (
-            f"The class is **{SHIFT}**."
+            "I can analyse the SmartAttend database and explain the application. 🤖\n\n"
+            "**I can answer:**\n"
+            "• Present/absent lists for today or any stored date\n"
+            "• Individual attendance and history\n"
+            "• Highest, lowest and average attendance\n"
+            "• Students below 75% and risk status\n"
+            "• Attendance percentages and class statistics\n"
+            "• Working days, holidays and calendar information\n"
+            "• Attendance timing and system rules\n"
+            "• Student registration details\n"
+            "• Questions about SmartAttend features and workflow\n\n"
+            "You do not need to use an exact sentence. Ask naturally."
         )
 
-    if (
-        "class details" in q
-        or "class information" in q
-        or "our class" in q
-        or "about our class" in q
-    ):
-
+    # Application information
+    if any(x in q for x in ["what is smartattend", "what is this app", "what is this application", "about the attendance app", "tell me about smartattend", "tell me about the attendance app", "attendance system about"]):
         return (
-            "Here are the SmartAttend class details:\n\n"
+            "🎓 **SmartAttend AI** is a college attendance management system for "
+            f"**{DEPARTMENT} — {YEAR}, {SHIFT}**.\n\n"
+            "Students verify their registered roll number and name, then mark attendance "
+            "during the controlled **1:00 PM–1:15 PM** window on working days. Duplicate "
+            "attendance is prevented. After the session, students who did not mark attendance "
+            "are recorded as absent.\n\n"
+            "The system also provides date-wise attendance history, attendance analytics, "
+            "75% risk monitoring, college calendar/holiday handling, admin reporting, "
+            "WhatsApp-ready reports and this database-grounded AI assistant."
+        )
+
+    if any(x in q for x in ["minimum attendance", "attendance requirement", "required attendance", "how much attendance", "attendance percentage required"]):
+        return f"The minimum attendance requirement is **{MIN_ATTENDANCE:.0f}%**. Students below this level are classified as **At Risk**."
+
+    if any(x in q for x in ["attendance time", "attendance timing", "when can i mark", "when can students mark", "what time can", "time to mark attendance"]):
+        return "Students can mark attendance only from **1:00 PM to 1:15 PM** on a working day. Each student can mark only once for the session."
+
+    if any(x in q for x in ["after 1:15", "after 1.15", "what happens after", "if i don't mark", "if i do not mark", "miss attendance"]):
+        return "After **1:15 PM**, the attendance window closes. Students can no longer mark attendance for that session, and unmarked students are automatically recorded as **Absent** when the session is finalized."
+
+    if "department" in q and not student:
+        return f"The department is **{DEPARTMENT}**."
+    if any(x in q for x in ["which year", "what year", "year are we", "class year"]):
+        return f"The class is **{YEAR}**."
+    if "shift" in q:
+        return f"The class is **{SHIFT}**."
+    if any(x in q for x in ["class details", "class information", "about our class", "our class"]):
+        return (
             f"🎓 Department: {DEPARTMENT}\n"
             f"📚 Year: {YEAR}\n"
             f"🕑 Shift: {SHIFT}\n"
-            f"👩‍🎓 Students: {len(STUDENTS)}\n"
-            f"📊 Minimum attendance: "
-            f"{MIN_ATTENDANCE:.0f}%\n"
-            "⏰ Attendance: 1:00 PM – 1:15 PM"
+            f"👩‍🎓 Registered Students: {len(STUDENTS)}\n"
+            f"📊 Minimum Attendance: {MIN_ATTENDANCE:.0f}%\n"
+            "⏰ Attendance Window: 1:00 PM–1:15 PM"
         )
 
-    if (
-        "how many students" in q
-        or "total students" in q
-        or "number of students" in q
-        or "registered students" in q
-        or "how many are registered" in q
-    ):
+    if any(x in q for x in ["how many students", "total students", "number of students", "registered students"]):
+        return f"There are **{len(STUDENTS)} registered students** in SmartAttend."
 
-        return (
-            f"There are **{len(STUDENTS)} registered students** "
-            "in SmartAttend."
-        )
+    # Date + calendar questions should be handled before generic date attendance.
+    if requested_date and any(x in q for x in ["holiday", "working day", "working", "calendar", "non working", "non-working"]):
+        return calendar_answer_for_date(requested_date)
 
-    # ========================================================
-    # STUDENT NAME / ROLL NUMBER
-    # ========================================================
+    # Exact student identity
+    if student and any(x in q for x in ["name", "who is", "roll number", "roll no", "registration", "registered"]):
+        return f"**{student[1]}** is registered with roll number **{student[0]}**."
 
+    # Individual student attendance and date-specific status
     if student:
-
-        roll_no = student[0]
-        student_name = student[1]
-
-        asks_identity = (
-            "name" in q
-            or "who is" in q
-            or "belongs" in q
-            or "roll" in q
-            or "registration" in q
-            or "registered" in q
-        )
-
-        if asks_identity:
-
-            if re.search(
-                r"\bE25AI\d{3}\b",
-                question.upper()
-            ):
-
-                return (
-                    f"Yes. **{roll_no}** is registered "
-                    f"to **{student_name}**."
-                )
-
-            return (
-                f"**{student_name}** is registered with "
-                f"roll number **{roll_no}**."
-            )
-
-    # ========================================================
-    # STUDENT ATTENDANCE INFORMATION
-    # ========================================================
-
-    if student:
-
-        roll_no = student[0]
-        student_name = student[1]
-
-        total, present, absent, percentage = (
-            get_student_attendance(
-                roll_no
-            )
-        )
-
-        # ----------------------------------------------------
-        # DATE-SPECIFIC STUDENT ATTENDANCE
-        # ----------------------------------------------------
-
+        roll_no, student_name = student
         if requested_date:
+            records = get_records_for_date(requested_date, SUBJECT)
+            record = next((r for r in records if r[0] == roll_no), None)
+            if record:
+                if record[2] == "Present":
+                    return f"Yes — **{student_name}** was **Present** on **{_date_label(requested_date)}**. Attendance was marked at **{record[3]}**."
+                return f"**{student_name}** was **Absent** on **{_date_label(requested_date)}**."
+            if not is_working_day(requested_date):
+                return f"**{_date_label(requested_date)}** was a non-working day, so there was no attendance session."
+            return f"There is no finalized attendance record for **{student_name}** on **{_date_label(requested_date)}** yet."
 
-            records = get_records_for_date(
-                requested_date,
-                SUBJECT
-            )
+        total, present, absent, percentage = get_student_attendance(roll_no)
+        if any(x in q for x in ["history", "attendance history", "records", "when was"]):
+            records = [r for r in get_all_attendance() if r[0] == roll_no]
+            if not records:
+                return f"There is no attendance history available for **{student_name}** yet."
+            lines = [f"📚 **Attendance History — {student_name} ({roll_no})**", ""]
+            for r in sorted(records, key=lambda x: x[2]):
+                lines.append(f"• {_date_label(r[2])} — **{r[4]}**" + (f" at {r[5]}" if r[4] == "Present" else ""))
+            return "\n".join(lines)
 
-            student_record = None
-
-            for record in records:
-
-                if record[0] == roll_no:
-
-                    student_record = record
-
-                    break
-
-            if student_record:
-
-                status_value = student_record[2]
-
-                if status_value == "Present":
-
-                    return (
-                        f"Yes — **{student_name}** was "
-                        f"**Present** on "
-                        f"{format_date(requested_date)}. "
-                        f"Attendance was marked at "
-                        f"{student_record[3]}."
-                    )
-
-                return (
-                    f"**{student_name}** was recorded as "
-                    f"**Absent** on "
-                    f"{format_date(requested_date)}."
-                )
-
-            if not is_working_day(
-                requested_date
-            ):
-
-                return (
-                    f"{format_date(requested_date)} was a "
-                    f"non-working day, so there was no "
-                    "attendance session."
-                )
-
-            return (
-                f"I don't have an attendance record for "
-                f"**{student_name}** on "
-                f"{format_date(requested_date)} yet."
-            )
-
-        # ----------------------------------------------------
-        # CURRENT ATTENDANCE
-        # ----------------------------------------------------
-
-        if (
-            "attendance" in q
-            or "percentage" in q
-            or "present" in q
-            or "absent" in q
-            or "status" in q
-            or "risk" in q
-            or "safe" in q
-            or "classes" in q
-            or "sessions" in q
-        ):
-
+        if any(x in q for x in ["reach 75", "get to 75", "achieve 75", "improve to 75", "how many classes", "how many sessions", "how many more"]):
             if total == 0:
+                return f"**{student_name}** has no completed attendance sessions yet, so a 75% recovery calculation cannot be made."
+            if percentage >= MIN_ATTENDANCE:
+                return f"**{student_name}** is already at **{percentage:.2f}%**, which meets the {MIN_ATTENDANCE:.0f}% requirement."
+            needed = required_future_classes_for_75(present, total)
+            return f"**{student_name}** currently has **{percentage:.2f}%** attendance and needs to attend the next **{needed} consecutive classes** to reach {MIN_ATTENDANCE:.0f}%, assuming no further absence."
 
-                return (
-                    f"I don't have any completed "
-                    f"attendance sessions for "
-                    f"**{student_name}** yet.\n\n"
-                    f"Present: 0\n"
-                    f"Absent: 0\n"
-                    f"Attendance: **N/A**\n"
-                    f"Status: **No Data**"
-                )
+        if any(x in q for x in ["can i miss", "can she miss", "can he miss", "how many can i miss", "how many classes can i miss", "how many more can"]):
+            if total == 0:
+                return f"There is not enough attendance data for **{student_name}** yet."
+            if percentage < MIN_ATTENDANCE:
+                return f"**{student_name}** is currently below {MIN_ATTENDANCE:.0f}%, so missing more classes would increase the risk."
+            allowed = maximum_future_absences_at_75(present, total)
+            return f"**{student_name}** currently has **{percentage:.2f}%** attendance and can miss up to **{allowed} more class(es)** while remaining at or above {MIN_ATTENDANCE:.0f}%, assuming no other changes."
 
-            risk = (
-                "At Risk"
-                if percentage < MIN_ATTENDANCE
-                else "Safe"
-            )
+        if any(x in q for x in ["attendance", "percentage", "present", "absent", "status", "risk", "classes", "sessions"]):
+            if total == 0:
+                return f"There are no completed attendance sessions for **{student_name}** yet.\n\nPresent: 0\nAbsent: 0\nAttendance: **N/A**\nStatus: **No Data**"
+            risk = "At Risk" if percentage < MIN_ATTENDANCE else "Safe"
+            return f"📊 **Attendance — {student_name} ({roll_no})**\n\nSessions: {total}\nPresent: {present}\nAbsent: {absent}\nAttendance: **{percentage:.2f}%**\nStatus: **{risk}**"
 
-            return (
-                f"Here's the current attendance for "
-                f"**{student_name}** ({roll_no}):\n\n"
-                f"📚 Sessions: {total}\n"
-                f"✅ Present: {present}\n"
-                f"❌ Absent: {absent}\n"
-                f"📊 Attendance: **{percentage:.2f}%**\n"
-                f"⚠️ Status: **{risk}**"
-            )
+    # Present / absent list for a requested date, including natural wording such as "absentees".
+    status = None
+    absent_words = ["absent", "absentee", "absentees", "didn't attend", "did not attend", "not attend", "missed", "missing students", "who missed"]
+    present_words = ["present", "attended", "who attended", "came today", "who came", "students who came"]
+    if any(x in q for x in absent_words):
+        status = "absent"
+    elif any(x in q for x in present_words):
+        status = "present"
 
-    # ========================================================
-    # CAN STUDENT REACH 75%
-    # ========================================================
+    if status:
+        if requested_date is None:
+            requested_date = today_date()
+        return _date_attendance_answer(requested_date, status)
 
-    if student and (
-        "reach 75" in q
-        or "get to 75" in q
-        or "achieve 75" in q
-        or "come back to 75" in q
-        or "improve to 75" in q
-    ):
+    # Today's / selected-date summary
+    if requested_date and any(x in q for x in ["summary", "attendance", "details", "report", "how many"]):
+        return _date_attendance_answer(requested_date)
 
-        roll_no = student[0]
-        student_name = student[1]
-
-        total, present, absent, percentage = (
-            get_student_attendance(
-                roll_no
-            )
-        )
-
-        if total == 0:
-
-            return (
-                f"**{student_name}** has no completed "
-                "attendance sessions yet, so there isn't "
-                "enough data to calculate a recovery plan."
-            )
-
-        if percentage >= MIN_ATTENDANCE:
-
-            return (
-                f"Yes — **{student_name}** is already at "
-                f"**{percentage:.2f}%**, which is above the "
-                f"{MIN_ATTENDANCE:.0f}% requirement."
-            )
-
-        needed = required_future_classes_for_75(
-            present,
-            total
-        )
-
-        return (
-            f"Yes. **{student_name}** can reach "
-            f"{MIN_ATTENDANCE:.0f}% by attending the next "
-            f"**{needed} consecutive classes** without "
-            "missing one.\n\n"
-            f"Current attendance: {percentage:.2f}%"
-        )
-
-    # ========================================================
-    # HOW MANY CLASSES NEEDED
-    # ========================================================
-
-    if student and (
-        "how many classes" in q
-        or "how many sessions" in q
-        or "how many more" in q
-    ) and (
-        "75" in q
-        or "required" in q
-        or "attendance" in q
-    ):
-
-        roll_no = student[0]
-        student_name = student[1]
-
-        total, present, absent, percentage = (
-            get_student_attendance(
-                roll_no
-            )
-        )
-
-        if total == 0:
-
-            return (
-                f"**{student_name}** has no completed "
-                "attendance sessions yet."
-            )
-
-        if percentage >= MIN_ATTENDANCE:
-
-            return (
-                f"**{student_name}** is already above the "
-                f"{MIN_ATTENDANCE:.0f}% requirement at "
-                f"{percentage:.2f}%."
-            )
-
-        needed = required_future_classes_for_75(
-            present,
-            total
-        )
-
-        return (
-            f"**{student_name}** currently has "
-            f"{percentage:.2f}% attendance.\n\n"
-            f"They need to attend the next "
-            f"**{needed} classes consecutively** "
-            f"to reach {MIN_ATTENDANCE:.0f}%."
-        )
-
-    # ========================================================
-    # HOW MANY CLASSES CAN BE MISSED
-    # ========================================================
-
-    if student and (
-        "how many can i miss" in q
-        or "how many classes can i miss" in q
-        or "how many can she miss" in q
-        or "how many can he miss" in q
-        or "how many more can" in q
-    ):
-
-        roll_no = student[0]
-        student_name = student[1]
-
-        total, present, absent, percentage = (
-            get_student_attendance(
-                roll_no
-            )
-        )
-
-        if total == 0:
-
-            return (
-                f"There isn't enough attendance data for "
-                f"**{student_name}** yet."
-            )
-
-        allowed = maximum_future_absences_at_75(
-            present,
-            total
-        )
-
-        if percentage < MIN_ATTENDANCE:
-
-            return (
-                f"**{student_name}** is currently below "
-                f"{MIN_ATTENDANCE:.0f}%, so the focus should "
-                "be on attending upcoming classes rather "
-                "than missing more."
-            )
-
-        if allowed == 0:
-
-            return (
-                f"**{student_name}** is currently at "
-                f"{percentage:.2f}%. To stay at or above "
-                f"{MIN_ATTENDANCE:.0f}%, they should not miss "
-                "the next class."
-            )
-
-        return (
-            f"**{student_name}** currently has "
-            f"{percentage:.2f}% attendance and can miss "
-            f"up to **{allowed} more class(es)** while "
-            f"remaining at or above {MIN_ATTENDANCE:.0f}%, "
-            "assuming no other attendance changes."
-        )
-
-    # ========================================================
-    # BELOW 75% / AT RISK
-    # ========================================================
-
-    if (
-        "below 75" in q
-        or "below 75%" in q
-        or "less than 75" in q
-        or "under 75" in q
-        or "at risk" in q
-        or "low attendance students" in q
-        or "who needs to improve" in q
-        or "who need to improve" in q
-        or "students at risk" in q
-    ):
-
-        risky = [
-            s
-            for s in summary
-            if (
-                s["Attendance %"] != "N/A"
-                and s["Attendance %"] < MIN_ATTENDANCE
-            )
-        ]
-
+    # Analytics across completed attendance
+    summary = [s for s in get_attendance_summary() if s["Total Sessions"] > 0 and s["Attendance %"] is not None]
+    if any(x in q for x in ["below 75", "under 75", "less than 75", "at risk", "need to improve"]):
+        risky = [s for s in summary if s["Attendance %"] < MIN_ATTENDANCE]
         if not risky:
-
-            if all(
-                s["Total Sessions"] == 0
-                for s in summary
-            ):
-
-                return (
-                    "There are no completed attendance "
-                    "sessions yet, so nobody can be classified "
-                    "as below 75% at the moment. "
-                    "Attendance will be calculated once "
-                    "sessions are completed."
-                )
-
-            return (
-                f"Good news! 😊 No student is currently "
-                f"below the {MIN_ATTENDANCE:.0f}% requirement."
-            )
-
-        lines = [
-            f"⚠️ I found {len(risky)} student(s) "
-            f"below the {MIN_ATTENDANCE:.0f}% requirement:"
-        ]
-
-        for s in risky:
-
-            lines.append(
-                f"• {s['Roll No']} — "
-                f"{s['Name']}: "
-                f"{s['Attendance %']}%"
-            )
-
+            return "There are no students currently below 75% based on completed attendance sessions."
+        lines = [f"⚠️ **{len(risky)} student(s) below {MIN_ATTENDANCE:.0f}%**", ""]
+        lines.extend(f"{i}. {s['Roll No']} — {s['Name']} — **{s['Attendance %']:.2f}%**" for i, s in enumerate(sorted(risky, key=lambda x: x["Attendance %"]), 1))
         return "\n".join(lines)
 
-    # ========================================================
-    # HIGHEST ATTENDANCE
-    # ========================================================
-
-    if (
-        "highest attendance" in q
-        or "best attendance" in q
-        or "maximum attendance" in q
-        or "who has the highest" in q
-        or "who has the best" in q
-    ):
-
-        valid = [
-            s
-            for s in summary
-            if s["Total Sessions"] > 0
-        ]
-
-        if not valid:
-
-            return (
-                "No attendance sessions have been "
-                "completed yet, so there is no highest "
-                "attendance percentage to compare."
-            )
-
-        highest = max(
-            valid,
-            key=lambda x: x["Attendance %"]
-        )
-
-        return (
-            f"🏆 **{highest['Name']}** currently has the "
-            f"highest attendance at "
-            f"**{highest['Attendance %']}%** "
-            f"({highest['Roll No']})."
-        )
-
-    # ========================================================
-    # LOWEST ATTENDANCE
-    # ========================================================
-
-    if (
-        "lowest attendance" in q
-        or "lowest" in q
-        or "who has the lowest" in q
-        or "worst attendance" in q
-        or "minimum attendance among students" in q
-    ):
-
-        valid = [
-            s
-            for s in summary
-            if s["Total Sessions"] > 0
-        ]
-
-        if not valid:
-
-            return (
-                "No attendance sessions have been "
-                "completed yet, so there is no lowest "
-                "attendance percentage to compare."
-            )
-
-        lowest = min(
-            valid,
-            key=lambda x: x["Attendance %"]
-        )
-
-        return (
-            f"📉 **{lowest['Name']}** currently has the "
-            f"lowest attendance at "
-            f"**{lowest['Attendance %']}%** "
-            f"({lowest['Roll No']})."
-        )
-
-    # ========================================================
-    # TODAY'S ABSENT STUDENTS
-    # ========================================================
-
-    if (
-        "absent today" in q
-        or "who is absent today" in q
-        or "who are absent today" in q
-        or "today absent" in q
-    ):
-
-        if not is_working_day():
-
-            return (
-                f"Today is a non-working day.\n\n"
-                f"Reason: {get_non_working_day_reason()}"
-            )
-
-        records = get_today_records(
-            SUBJECT
-        )
-
-        absent = [
-            r
-            for r in records
-            if r[2] == "Absent"
-        ]
-
-        if not absent:
-
-            return (
-                "There are no recorded absent students "
-                "for today's session yet."
-            )
-
-        lines = [
-            f"❌ Today's absent students "
-            f"({len(absent)}):"
-        ]
-
-        for r in absent:
-
-            lines.append(
-                f"• {r[0]} — {r[1]}"
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # TODAY'S PRESENT STUDENTS
-    # ========================================================
-
-    if (
-        "present today" in q
-        or "who is present today" in q
-        or "who are present today" in q
-        or "today present" in q
-    ):
-
-        if not is_working_day():
-
-            return (
-                f"Today is a non-working day.\n\n"
-                f"Reason: {get_non_working_day_reason()}"
-            )
-
-        records = get_today_records(
-            SUBJECT
-        )
-
-        present_records = [
-            r
-            for r in records
-            if r[2] == "Present"
-        ]
-
-        if not present_records:
-
-            return (
-                "There are no recorded present students "
-                "for today's session yet."
-            )
-
-        lines = [
-            f"✅ Today's present students "
-            f"({len(present_records)}):"
-        ]
-
-        for r in present_records:
-
-            lines.append(
-                f"• {r[0]} — {r[1]}"
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # TODAY'S SUMMARY
-    # ========================================================
-
-    if (
-        (
-            "today" in q
-            or "today's" in q
-        )
-        and (
-            "summary" in q
-            or "attendance" in q
-            or "present" in q
-            or "absent" in q
-        )
-    ):
-
-        if not is_working_day():
-
-            return (
-                f"🏖️ Today is a non-working day.\n\n"
-                f"Reason: {get_non_working_day_reason()}\n\n"
-                "There is no attendance session today."
-            )
-
-        present, absent = (
-            get_today_counts(
-                SUBJECT
-            )
-        )
-
-        if present + absent == 0:
-
-            return (
-                "Today's attendance session has not "
-                "recorded any attendance yet.\n\n"
-                f"Total Students: {len(STUDENTS)}\n"
-                "Present: 0\n"
-                "Absent: Not finalized yet"
-            )
-
-        return (
-            "📊 Here's today's attendance summary:\n\n"
-            f"Total Students: {len(STUDENTS)}\n"
-            f"Present: {present}\n"
-            f"Absent: {absent}"
-        )
-
-    # ========================================================
-    # SPECIFIC DATE CALENDAR
-    # ========================================================
-
-    if requested_date and (
-        "holiday" in q
-        or "working" in q
-        or "calendar" in q
-        or "date" in q
-        or "college" in q
-    ):
-
-        return calendar_answer_for_date(
-            requested_date
-        )
-
-    # ========================================================
-    # TOMORROW / YESTERDAY / DATE QUESTIONS
-    # ========================================================
-
-    if requested_date:
-
-        records = get_records_for_date(
-            requested_date,
-            SUBJECT
-        )
-
-        if records:
-
-            present_count = sum(
-                1
-                for r in records
-                if r[2] == "Present"
-            )
-
-            absent_count = sum(
-                1
-                for r in records
-                if r[2] == "Absent"
-            )
-
-            return (
-                f"📅 Attendance for "
-                f"{format_date(requested_date)}:\n\n"
-                f"Present: {present_count}\n"
-                f"Absent: {absent_count}"
-            )
-
-        return calendar_answer_for_date(
-            requested_date
-        )
-
-    # ========================================================
-    # GENERAL HOLIDAY / WORKING DAY
-    # ========================================================
-
-    if (
-        "working day" in q
-        or "holiday" in q
-        or "today working" in q
-        or "today holiday" in q
-        or "is today a holiday" in q
-        or "is today working" in q
-        or "college today" in q
-    ):
-
-        return calendar_answer_for_date(
-            today_date()
-        )
-
-    # ========================================================
-    # ATTENDANCE HISTORY
-    # ========================================================
-
-    if student and (
-        "history" in q
-        or "records" in q
-        or "attendance history" in q
-    ):
-
-        records = []
-
-        all_records = get_all_attendance()
-
-        for record in all_records:
-
-            if record[0] == student[0]:
-
-                records.append(record)
-
-        if not records:
-
-            return (
-                f"There is no attendance history available "
-                f"for **{student[1]}** yet."
-            )
-
-        lines = [
-            f"📚 Attendance history for "
-            f"**{student[1]}**:"
-        ]
-
-        for record in records:
-
-            lines.append(
-                f"• {format_date(record[2])} — "
-                f"{record[4]}"
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # WHO IS REGISTERED
-    # ========================================================
-
-    if (
-        "list students" in q
-        or "show students" in q
-        or "all students" in q
-        or "student list" in q
-        or "registered list" in q
-    ):
-
-        lines = [
-            f"Here are all {len(STUDENTS)} registered students:"
-        ]
-
-        for index, (roll_no, name) in enumerate(
-            STUDENTS,
-            start=1
-        ):
-
-            lines.append(
-                f"{index}. {roll_no} — {name}"
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # DATABASE STATUS
-    # ========================================================
-
-    if (
-        "database" in q
-        or "data available" in q
-        or "how much data" in q
-    ):
-
-        total_records = len(
-            get_all_attendance()
-        )
-
-        return (
-            "SmartAttend currently has:\n\n"
-            f"👩‍🎓 Registered students: {len(STUDENTS)}\n"
-            f"📚 Attendance records: {total_records}\n"
-            f"📊 Minimum attendance: "
-            f"{MIN_ATTENDANCE:.0f}%"
-        )
-
-    # ========================================================
-    # UNKNOWN QUESTION
-    # ========================================================
+    if any(x in q for x in ["highest attendance", "highest percentage", "best attendance", "top attendance", "most attendance", "who has the highest"]):
+        if not summary:
+            return "There are no completed attendance sessions yet, so a highest-attendance result cannot be calculated."
+        top = max(summary, key=lambda x: x["Attendance %"])
+        return f"🏆 **Highest Attendance**\n\n{top['Name']} ({top['Roll No']})\nAttendance: **{top['Attendance %']:.2f}%**\nPresent: {top['Present']}\nAbsent: {top['Absent']}\nSessions: {top['Total Sessions']}"
+
+    if any(x in q for x in ["lowest attendance", "lowest percentage", "worst attendance", "least attendance", "who has the lowest"]):
+        if not summary:
+            return "There are no completed attendance sessions yet, so a lowest-attendance result cannot be calculated."
+        low = min(summary, key=lambda x: x["Attendance %"])
+        return f"📉 **Lowest Attendance**\n\n{low['Name']} ({low['Roll No']})\nAttendance: **{low['Attendance %']:.2f}%**\nPresent: {low['Present']}\nAbsent: {low['Absent']}\nSessions: {low['Total Sessions']}"
+
+    if any(x in q for x in ["average attendance", "class average", "average percentage", "overall attendance"]):
+        if not summary:
+            return "There are no completed attendance sessions yet, so the class average cannot be calculated."
+        avg = sum(s["Attendance %"] for s in summary) / len(summary)
+        return f"📊 **Class Average Attendance: {avg:.2f}%** based on {len(summary)} students with completed attendance data."
+
+    if any(x in q for x in ["perfect attendance", "100% attendance"]):
+        perfect = [s for s in summary if abs(s["Attendance %"] - 100) < 1e-9]
+        if not perfect:
+            return "No student currently has 100% attendance based on completed sessions."
+        return "🏅 **Perfect Attendance**\n\n" + "\n".join(f"{i}. {s['Roll No']} — {s['Name']}" for i, s in enumerate(perfect, 1))
+
+    if any(x in q for x in ["rank", "top 5", "top five", "bottom 5", "bottom five"]):
+        if not summary:
+            return "There are no completed attendance sessions yet, so ranking cannot be calculated."
+        reverse = not any(x in q for x in ["bottom", "lowest"])
+        count = 5 if any(x in q for x in ["5", "five"]) else len(summary)
+        ranked = sorted(summary, key=lambda x: x["Attendance %"], reverse=reverse)[:count]
+        title = "Top Attendance Ranking" if reverse else "Lowest Attendance Ranking"
+        return f"📊 **{title}**\n\n" + "\n".join(f"{i}. {s['Name']} — {s['Attendance %']:.2f}%" for i, s in enumerate(ranked, 1))
+
+    # Today fallback only when the user is actually asking about attendance.
+    if requested_date is None and any(x in q for x in ["today", "todays", "today's"]):
+        if any(x in q for x in ["attendance", "present", "absent", "attend", "summary", "report"]):
+            return _date_attendance_answer(today_date())
+
+    # Student list
+    if any(x in q for x in ["list students", "show students", "all students", "student list", "registered list", "who are the students"]):
+        return "👩‍🎓 **Registered Students**\n\n" + "\n".join(f"{i}. {r} — {n}" for i, (r, n) in enumerate(get_all_students(), 1))
+
+    # Database status
+    if any(x in q for x in ["database", "data available", "how much data", "how many records"]):
+        total_records = len(get_all_attendance())
+        return f"🗄️ **SmartAttend Data Status**\n\nRegistered students: {len(STUDENTS)}\nAttendance records: {total_records}\nMinimum attendance: {MIN_ATTENDANCE:.0f}%"
+
+    # Calendar questions without explicit date.
+    if any(x in q for x in ["holiday", "working day", "is today working", "is today a holiday", "college today"]):
+        return calendar_answer_for_date(today_date())
 
     return None
 
 
-# ============================================================
-# CONVERSATIONAL ASSISTANT RESPONSE
-# ============================================================
-
 def assistant_response(question):
+    context_student = st.session_state.get("last_student")
+    answer = database_answer(question, context_student)
 
-    question_lower = question.lower().strip()
-
-    context_student = (
-        st.session_state.get(
-            "last_student"
-        )
-    )
-
-    if (
-        "tell me about the attendance app" in question_lower
-        or "tell me about smartattend" in question_lower
-        or "what is smartattend" in question_lower
-        or "what is the attendance app" in question_lower
-        or "about the attendance system" in question_lower
-        or "about the attendance application" in question_lower
-    ):
-
-        return (
-            "SmartAttend AI is a college attendance management system "
-            "designed to make attendance tracking simple, accurate and automated. 🎓🤖\n\n"
-
-            "The system allows registered students to verify their identity "
-            "using their roll number and name and mark attendance during the "
-            "specified attendance window.\n\n"
-
-            "SmartAttend automatically prevents duplicate attendance for the "
-            "same session and records students who do not mark attendance as "
-            "Absent when the attendance session is finalized.\n\n"
-
-            "The system also provides:\n\n"
-            "• Student attendance tracking\n"
-            "• Attendance percentage calculation\n"
-            "• 75% minimum attendance monitoring\n"
-            "• At-risk student identification\n"
-            "• Daily present and absent reports\n"
-            "• Complete attendance history\n"
-            "• College calendar and holiday information\n"
-            "• Automatic attendance finalization\n"
-            "• AI-powered attendance assistance\n"
-            "• Attendance analysis and insights\n\n"
-
-            "The AI Attendance Assistant can answer questions about students, "
-            "attendance, attendance requirements, working days, holidays, "
-            "attendance history and other information available in SmartAttend."
-        )
-
-    answer = database_answer(
-        question,
-        context_student
-    )
-
-    student = find_student_from_question(
-        question
-    )
-
+    student = find_student_from_question(question)
     if student:
-
-        st.session_state[
-            "last_student"
-        ] = student
+        st.session_state["last_student"] = student
 
     if answer:
-
         return answer
 
+    llm_answer = _llm_fallback(question, st.session_state.get("last_student"))
+    if llm_answer:
+        return llm_answer
+
     return (
-        "I can help you with SmartAttend AI. 🤖🎓\n\n"
-
-        "You can ask me about:\n\n"
-        "• Student names and roll numbers\n"
-        "• Individual attendance\n"
-        "• Present and absent students\n"
-        "• Attendance percentage\n"
-        "• Students below 75%\n"
-        "• Highest and lowest attendance\n"
-        "• Attendance history\n"
-        "• Today's attendance\n"
-        "• Holidays and working days\n"
-        "• College calendar events\n"
-        "• Attendance timing\n"
-        "• What happens after 1:15 PM\n"
-        "• Attendance risk analysis\n"
-        "• How many classes a student needs to attend to reach 75%\n"
-        "• Department, year and shift\n"
-        "• Registered student information\n\n"
-
-        "Try asking questions such as:\n\n"
-        "• What is the attendance requirement?\n"
-        "• What time can students mark attendance?\n"
-        "• Who is absent today?\n"
-        "• Who is below 75% attendance?\n"
-        "• Who has the highest attendance?\n"
-        "• Is tomorrow a working day?\n"
-        "• What happens after 1:15 PM?\n"
-        "• Show attendance history for a student.\n\n"
-
-        "You can also ask follow-up questions such as "
-        "\"What about that student?\" when student context is available."
+        "I can answer questions about the **SmartAttend application and its stored data**, "
+        "but I couldn't identify the exact information you requested. 🤖\n\n"
+        "Try asking naturally, for example:\n"
+        "• Who are today's absentees?\n"
+        "• Who attended today?\n"
+        "• Who was absent on 15-09-2026?\n"
+        "• Show attendance for a student\n"
+        "• Who has the lowest attendance?\n"
+        "• Who is below 75%?\n"
+        "• What is the class average?\n"
+        "• Is tomorrow a holiday?\n"
+        "• Explain how SmartAttend works."
     )
 
 # ============================================================
@@ -3455,6 +2853,56 @@ elif page == "🔐 Admin Dashboard":
                 f"✅ No student is currently below "
                 f"the {MIN_ATTENDANCE:.0f}% requirement."
             )
+
+        # ====================================================
+        # ATTENDANCE REGISTER - STUDENT x DATE MATRIX
+        # ====================================================
+
+        st.divider()
+        st.subheader("📊 Attendance Register")
+        st.caption("Rows = students • Columns = attendance dates • P = Present • A = Absent • - = No record")
+
+        history_dates = _history_matrix_data()
+
+        if history_dates:
+            min_history = datetime.fromisoformat(history_dates[0]).date()
+            max_history = datetime.fromisoformat(history_dates[-1]).date()
+
+            r1, r2 = st.columns(2)
+            with r1:
+                register_from = st.date_input(
+                    "From Date",
+                    value=min_history,
+                    min_value=min_history,
+                    max_value=max_history,
+                    key="register_from"
+                )
+            with r2:
+                register_to = st.date_input(
+                    "To Date",
+                    value=max_history,
+                    min_value=min_history,
+                    max_value=max_history,
+                    key="register_to"
+                )
+
+            if register_from > register_to:
+                st.error("From Date cannot be later than To Date.")
+            else:
+                matrix = build_attendance_matrix(
+                    register_from.isoformat(),
+                    register_to.isoformat()
+                )
+                if matrix:
+                    st.dataframe(
+                        matrix,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No attendance records are available in the selected date range.")
+        else:
+            st.info("Attendance Register will appear here after the first attendance session is finalized.")
 
         # ====================================================
         # COMPLETE ATTENDANCE HISTORY
