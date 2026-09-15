@@ -2,3 +2,6 @@ streamlit
 pandas
 transformers
 torch
+APScheduler
+requests
+python-dotenv
