@@ -1,7 +1,7 @@
 streamlit
-pandas
-transformers
-torch
-APScheduler
-requests
+supabase
 python-dotenv
+pandas
+requests
+apscheduler
+huggingface_hub
